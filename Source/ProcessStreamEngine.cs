@@ -19,12 +19,27 @@ public class ProcessStreamEngine : IDisposable
 	/// <summary>
 	/// The process being monitored.
 	/// </summary>
-	protected Process Process { get; }
+	protected Process Process { get; private set; }
+
+	/// <summary>
+	/// When true, the process is started by <see cref="StartMonitoringAsync"/> rather than at construction.
+	/// </summary>
+	private readonly bool deferredStart;
+
+	/// <summary>
+	/// Whether <see cref="EnsureProcessStarted"/> has been called.
+	/// </summary>
+	private bool processStarted;
+
+	/// <summary>
+	/// Command line for deferred Instance.Start when using <see cref="CreateDeferredFromInstance"/>.
+	/// </summary>
+	private readonly (string FileName, string Arguments)? deferredInstanceStart;
 
 	/// <summary>
 	/// The IProcessInstance if created from Instances library, null otherwise.
 	/// </summary>
-	protected IProcessInstance? ProcessInstance { get; }
+	protected IProcessInstance? ProcessInstance { get; private set; }
 
 	/// <summary>
 	/// Stream monitors for stdout and stderr.
@@ -117,6 +132,8 @@ public class ProcessStreamEngine : IDisposable
 		{
 			throw new ArgumentException("Process must have RedirectStandardOutput and RedirectStandardError set to true.", nameof(process));
 		}
+
+		processStarted = true;
 	}
 
 	/// <summary>
@@ -125,6 +142,11 @@ public class ProcessStreamEngine : IDisposable
 	/// </summary>
 	/// <param name="processInstance">The process instance to monitor.</param>
 	/// <exception cref="ArgumentNullException">Thrown when processInstance is null.</exception>
+	/// <remarks>
+	/// Register event and data capture handlers before calling <see cref="StartMonitoringAsync"/>
+	/// so output produced immediately after start is not missed. For fast-exiting processes,
+	/// prefer <see cref="CreateDeferredFromInstance"/> so handlers can be registered before the process starts.
+	/// </remarks>
 	public ProcessStreamEngine(IProcessInstance processInstance)
 	{
 		if (processInstance == null)
@@ -132,6 +154,68 @@ public class ProcessStreamEngine : IDisposable
 
 		ProcessInstance = processInstance;
 		Process = ExtractProcessFromInstance(processInstance);
+		processStarted = true;
+	}
+
+	/// <summary>
+	/// Creates an engine that starts the process when <see cref="StartMonitoringAsync"/> is called,
+	/// allowing handlers to be registered first and avoiding missed early output.
+	/// </summary>
+	/// <param name="startInfo">Process start configuration. RedirectStandardOutput and RedirectStandardError must be true.</param>
+	public static ProcessStreamEngine CreateDeferred(ProcessStartInfo startInfo) =>
+		new(startInfo);
+
+	/// <summary>
+	/// Creates an engine that starts a process via <see cref="Instances.Instance.Start(string, string)"/>
+	/// when <see cref="StartMonitoringAsync"/> is called, allowing handlers to be registered first.
+	/// </summary>
+	/// <param name="fileName">The executable or command to run.</param>
+	/// <param name="arguments">Optional command-line arguments.</param>
+	public static ProcessStreamEngine CreateDeferredFromInstance(string fileName, string arguments = "") =>
+		new(fileName, arguments);
+
+	private ProcessStreamEngine(ProcessStartInfo startInfo)
+	{
+		ArgumentNullException.ThrowIfNull(startInfo);
+
+		if (!startInfo.RedirectStandardOutput || !startInfo.RedirectStandardError)
+		{
+			throw new ArgumentException(
+				"Process must have RedirectStandardOutput and RedirectStandardError set to true.",
+				nameof(startInfo));
+		}
+
+		Process = new Process { StartInfo = startInfo };
+		deferredStart = true;
+	}
+
+	private ProcessStreamEngine(string fileName, string arguments)
+	{
+		if (string.IsNullOrWhiteSpace(fileName))
+			throw new ArgumentException("File name cannot be null or empty.", nameof(fileName));
+
+		deferredInstanceStart = (fileName, arguments ?? string.Empty);
+		deferredStart = true;
+		Process = null!;
+	}
+
+	private void EnsureProcessStarted()
+	{
+		if (processStarted)
+			return;
+
+		if (deferredInstanceStart is { } cmd)
+		{
+			var instance = Instance.Start(cmd.FileName, cmd.Arguments);
+			ProcessInstance = instance;
+			Process = ExtractProcessFromInstance(instance);
+		}
+		else
+		{
+			Process.Start();
+		}
+
+		processStarted = true;
 	}
 
 	/// <summary>
@@ -289,28 +373,145 @@ public class ProcessStreamEngine : IDisposable
 
 	/// <summary>
 	/// Starts monitoring the process output and error streams.
+	/// If the process has already exited, remaining stdout/stderr is drained and processed
+	/// through the same handlers as live monitoring — no exception is thrown.
 	/// </summary>
 	/// <param name="cancellationToken">Optional cancellation token to stop monitoring.</param>
-	/// <returns>A task that completes when monitoring stops.</returns>
+	/// <returns>A task that completes when monitoring is set up (or drained for an already-exited process).</returns>
 	public async Task StartMonitoringAsync(CancellationToken cancellationToken = default)
 	{
-		if (Process.HasExited)
-			throw new InvalidOperationException("Process has already exited.");
+		EnsureProcessStarted();
 
 		var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(CancellationTokenSource.Token, cancellationToken);
 		var token = linkedCts.Token;
 
-		// If using IProcessInstance, monitor its OutputData/ErrorData collections
-		// The Instances library manages streams internally
+		if (Process.HasExited)
+		{
+			await DrainRemainingOutputAsync(token);
+			return;
+		}
+
+		try
+		{
+			if (ProcessInstance != null)
+				await StartInstanceMonitoringAsync(token);
+			else
+				await StartStreamMonitoringAsync(token);
+		}
+		catch (InvalidOperationException) when (Process.HasExited)
+		{
+			// Process exited between the HasExited check and stream/event setup (same pattern as Process.WaitForExitAsync).
+			await DrainRemainingOutputAsync(token);
+		}
+	}
+
+	/// <summary>
+	/// Drains any remaining stdout/stderr and feeds lines through console handlers, events, and data capture.
+	/// </summary>
+	private async Task DrainRemainingOutputAsync(CancellationToken token)
+	{
 		if (ProcessInstance != null)
 		{
-			await StartInstanceMonitoringAsync(token);
+			await DrainRemainingInstanceOutputAsync(token);
+			return;
 		}
-		else
+
+		var outputTask = Task.Run(async () =>
 		{
-			// Original approach: read from streams directly
-			await StartStreamMonitoringAsync(token);
+			try
+			{
+				await DrainStreamAsync(Process.StandardOutput, isErrorStream: false, token);
+			}
+			catch (OperationCanceledException)
+			{
+				// Expected when cancelled
+			}
+			catch (InvalidOperationException) when (Process.HasExited)
+			{
+				// Stream unavailable after exit — best effort
+			}
+		}, token);
+
+		var errorTask = Task.Run(async () =>
+		{
+			try
+			{
+				await DrainStreamAsync(Process.StandardError, isErrorStream: true, token);
+			}
+			catch (OperationCanceledException)
+			{
+				// Expected when cancelled
+			}
+			catch (InvalidOperationException) when (Process.HasExited)
+			{
+				// Stream unavailable after exit — best effort
+			}
+		}, token);
+
+		MonitoringTasks.Add(outputTask);
+		MonitoringTasks.Add(errorTask);
+		await Task.WhenAll(outputTask, errorTask);
+	}
+
+	/// <summary>
+	/// Drains remaining output from an IProcessInstance's OutputData/ErrorData collections.
+	/// </summary>
+	[UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "IProcessInstance implementations are known and preserved")]
+	private async Task DrainRemainingInstanceOutputAsync(CancellationToken token)
+	{
+		var outputDataProperty = ProcessInstance!.GetType().GetProperty("OutputData");
+		var errorDataProperty = ProcessInstance.GetType().GetProperty("ErrorData");
+
+		await ProcessExistingInstanceDataAsync(outputDataProperty, errorDataProperty);
+
+		var lastOutputCount = GetDataListCount(outputDataProperty, ProcessInstance);
+		var lastErrorCount = GetDataListCount(errorDataProperty, ProcessInstance);
+
+		lastOutputCount = await ProcessNewInstanceDataAsync(
+			outputDataProperty, ProcessInstance, lastOutputCount, isErrorStream: false);
+		lastErrorCount = await ProcessNewInstanceDataAsync(
+			errorDataProperty, ProcessInstance, lastErrorCount, isErrorStream: true);
+
+		var completedTask = Task.CompletedTask;
+		MonitoringTasks.Add(completedTask);
+		await completedTask;
+	}
+
+	/// <summary>
+	/// Reads all remaining lines from a stream to end-of-stream and processes them.
+	/// </summary>
+	private async Task DrainStreamAsync(StreamReader reader, bool isErrorStream, CancellationToken cancellationToken)
+	{
+		try
+		{
+			while (!cancellationToken.IsCancellationRequested)
+			{
+				var line = await reader.ReadLineAsync(cancellationToken);
+				if (line == null)
+					break;
+
+				await ProcessOutputLineAsync(line, isErrorStream);
+			}
 		}
+		catch (OperationCanceledException)
+		{
+			// Expected when cancelled
+		}
+		catch (ObjectDisposedException)
+		{
+			// Expected when process is disposed
+		}
+	}
+
+	/// <summary>
+	/// Processes a single output line through console streaming, events, and data capture.
+	/// </summary>
+	private async Task ProcessOutputLineAsync(string line, bool isErrorStream)
+	{
+		var monitor = GetMonitor(isErrorStream);
+		monitor.RecentLines.Add(line);
+		StreamLineToConsole(line, isErrorStream);
+		await ProcessLineAsync(line, isErrorStream);
 	}
 
 	/// <summary>
@@ -324,6 +525,18 @@ public class ProcessStreamEngine : IDisposable
 
 		// Process any existing data immediately
 		await ProcessExistingInstanceDataAsync(outputDataProperty, errorDataProperty);
+
+		if (Process.HasExited)
+		{
+			var lastOutputCount = GetDataListCount(outputDataProperty, ProcessInstance);
+			var lastErrorCount = GetDataListCount(errorDataProperty, ProcessInstance);
+			await ProcessNewInstanceDataAsync(
+				outputDataProperty, ProcessInstance, lastOutputCount, isErrorStream: false);
+			await ProcessNewInstanceDataAsync(
+				errorDataProperty, ProcessInstance, lastErrorCount, isErrorStream: true);
+			MonitoringTasks.Add(Task.CompletedTask);
+			return;
+		}
 
 		// Start polling task for new data
 		var monitorTask = Task.Run(async () =>
@@ -375,6 +588,10 @@ public class ProcessStreamEngine : IDisposable
 			{
 				// Expected when cancelled
 			}
+			catch (InvalidOperationException) when (Process.HasExited)
+			{
+				await DrainStreamAsync(Process.StandardOutput, isErrorStream: false, token);
+			}
 		}, token);
 
 		var errorTask = Task.Run(async () =>
@@ -387,11 +604,15 @@ public class ProcessStreamEngine : IDisposable
 			{
 				// Expected when cancelled
 			}
+			catch (InvalidOperationException) when (Process.HasExited)
+			{
+				await DrainStreamAsync(Process.StandardError, isErrorStream: true, token);
+			}
 		}, token);
 
 		MonitoringTasks.Add(outputTask);
 		MonitoringTasks.Add(errorTask);
-		
+
 		return Task.CompletedTask;
 	}
 
@@ -750,6 +971,9 @@ public class ProcessStreamEngine : IDisposable
 	[UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "IProcessInstance implementations are known and preserved")]
 	public async Task SendInputAsync(string input, CancellationToken cancellationToken = default)
 	{
+		if (deferredStart && !processStarted)
+			throw new InvalidOperationException("Process has not been started. Call StartMonitoringAsync() first.");
+
 		if (Process.HasExited)
 			throw new InvalidOperationException("Process has already exited.");
 
@@ -784,6 +1008,9 @@ public class ProcessStreamEngine : IDisposable
 	[UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "IProcessInstance implementations are known and preserved")]
 	public async Task<int> WaitForExitAsync(CancellationToken cancellationToken = default, int timeoutMs = 30000)
 	{
+		if (deferredStart && !processStarted)
+			throw new InvalidOperationException("Process has not been started. Call StartMonitoringAsync() first.");
+
 		using var timeoutCts = new CancellationTokenSource(timeoutMs);
 		using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 		var combinedToken = linkedCts.Token;
@@ -900,7 +1127,7 @@ public class ProcessStreamEngine : IDisposable
 		{
 			while (!cancellationToken.IsCancellationRequested && !Process.HasExited)
 			{
-				var line = await reader.ReadLineAsync();
+				var line = await reader.ReadLineAsync(cancellationToken);
 				
 				if (line == null)
 				{
@@ -912,25 +1139,11 @@ public class ProcessStreamEngine : IDisposable
 					continue;
 				}
 
-				// Stream to console if enabled
-				if (streamToConsole || ConsoleStreamHandler != null)
-				{
-					if (ConsoleStreamHandler != null)
-					{
-						ConsoleStreamHandler(line, isErrorStream);
-					}
-					else if (streamToConsole)
-					{
-						if (isErrorStream)
-							Console.Error.WriteLine(line);
-						else
-							Console.WriteLine(line);
-					}
-				}
-
-				// Process events and data capture
-				await ProcessLineAsync(line, isErrorStream);
+				await ProcessOutputLineAsync(line, isErrorStream);
 			}
+
+			if (Process.HasExited)
+				await DrainStreamAsync(reader, isErrorStream, cancellationToken);
 		}
 		catch (OperationCanceledException)
 		{
@@ -939,6 +1152,10 @@ public class ProcessStreamEngine : IDisposable
 		catch (ObjectDisposedException)
 		{
 			// Expected when process is disposed
+		}
+		catch (InvalidOperationException) when (Process.HasExited)
+		{
+			await DrainStreamAsync(reader, isErrorStream, cancellationToken);
 		}
 	}
 

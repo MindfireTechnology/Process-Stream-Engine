@@ -92,15 +92,42 @@ await engine.WaitForExitAsync();
 
 A typical session follows this order:
 
-1. Start or obtain a running process (`Instance.Start(...)` or `Process.Start()`).
-2. Create a `ProcessStreamEngine`.
-3. Register event patterns, data capture patterns, and optional console handlers.
-4. Call `StartMonitoringAsync()` to begin reading output.
-5. Optionally send input, wait for events, or read captured data while the process runs.
-6. Call `WaitForExitAsync()` when the process should finish.
-7. Dispose the engine (or use `using`) to stop monitoring and release resources.
+1. Create a `ProcessStreamEngine` (or use `CreateDeferred` / `CreateDeferredFromInstance` to start the process later).
+2. Register event patterns, data capture patterns, and optional console handlers.
+3. Call `StartMonitoringAsync()` to begin reading output (and start the process, if deferred).
+4. Optionally send input, wait for events, or read captured data while the process runs.
+5. Call `WaitForExitAsync()` when the process should finish.
+6. Dispose the engine (or use `using`) to stop monitoring and release resources.
 
 `ProcessStreamEngine` does **not** own the underlying process. Disposing the engine stops monitoring but does not kill or dispose the process.
+
+**Fast-exiting processes.** If a process exits before or during `StartMonitoringAsync()`, the engine drains any remaining stdout/stderr and runs it through the same handlers — no exception is thrown. `WaitForExitAsync()` returns the exit code immediately.
+
+**Deferred start (recommended for new code).** Use `CreateDeferred` or `CreateDeferredFromInstance` so handlers are registered before the process starts, avoiding missed early output:
+
+```csharp
+using var engine = ProcessStreamEngine.CreateDeferredFromInstance("ping", "-n 1 127.0.0.1");
+engine.RegisterDataCapture("ttl", @"TTL=(\d+)", captureGroup: "1");
+await engine.StartMonitoringAsync();  // starts process and begins monitoring
+await engine.WaitForExitAsync();
+```
+
+For `System.Diagnostics.Process`:
+
+```csharp
+var startInfo = new ProcessStartInfo("cmd.exe", "/c echo hello")
+{
+	RedirectStandardOutput = true,
+	RedirectStandardError = true,
+	UseShellExecute = false,
+	CreateNoWindow = true
+};
+
+using var engine = ProcessStreamEngine.CreateDeferred(startInfo);
+engine.RegisterStringEvent("done", "hello", () => { });
+await engine.StartMonitoringAsync();
+await engine.WaitForExitAsync();
+```
 
 ### Events vs. Data Capture
 
@@ -252,7 +279,9 @@ var (match, patternName) = await engine.WaitForAnyConditionAsync(
 | Member | Description |
 |---|---|
 | `ProcessStreamEngine(Process process)` | Monitor a process with redirected stdout/stderr. |
-| `ProcessStreamEngine(IProcessInstance processInstance)` | Monitor via the Instances library (uses reflection for stream access). |
+| `ProcessStreamEngine(IProcessInstance processInstance)` | Monitor via the Instances library (uses reflection for stream access). Register handlers before `StartMonitoringAsync()`. |
+| `CreateDeferred(ProcessStartInfo startInfo)` | Create an engine that starts the process when monitoring begins. |
+| `CreateDeferredFromInstance(string fileName, string arguments?)` | Create an engine that calls `Instance.Start` when monitoring begins. |
 
 ### Registration
 
@@ -268,7 +297,7 @@ Multiple handlers can be registered under the same event name; all are invoked o
 
 | Method | Description |
 |---|---|
-| `StartMonitoringAsync(cancellationToken?)` | Begin reading process output. |
+| `StartMonitoringAsync(cancellationToken?)` | Begin reading process output. Drains remaining output if the process has already exited. |
 | `StopMonitoring()` | Cancel monitoring tasks. |
 | `SendInputAsync(input, cancellationToken?)` | Write a line to stdin (appends newline if missing). |
 | `WaitForExitAsync(cancellationToken?, timeoutMs?)` | Wait for process exit, stop monitoring, return exit code. |
@@ -307,7 +336,7 @@ Multiple handlers can be registered under the same event name; all are invoked o
 
 ## Tips and Best Practices
 
-**Register patterns before monitoring.** Event and data patterns should be registered before calling `StartMonitoringAsync()` so early output is not missed.
+**Register patterns before monitoring.** Event and data patterns should be registered before calling `StartMonitoringAsync()` so early output is not missed. Use `CreateDeferred` or `CreateDeferredFromInstance` to eliminate the start/monitor race entirely.
 
 **Use `using` or `Dispose()`.** Monitoring runs on background tasks tied to a `CancellationTokenSource` that is released on dispose.
 

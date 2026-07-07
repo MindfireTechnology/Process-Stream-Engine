@@ -10,6 +10,39 @@ using Instances;
 namespace ProcessStreamEngine;
 
 /// <summary>
+/// Thrown when a process exits with a non-zero exit code and stderr is available.
+/// </summary>
+public sealed class ProcessStreamEngineException : Exception
+{
+	public int ExitCode { get; }
+	public string StandardError { get; }
+
+	public ProcessStreamEngineException(int exitCode, string standardError)
+		: base($"Process exited with code {exitCode}. Stderr: {standardError}")
+	{
+		ExitCode = exitCode;
+		StandardError = standardError;
+	}
+}
+
+/// <summary>
+/// Buffered text output from a completed process run.
+/// </summary>
+public sealed record ProcessTextResult(int ExitCode, string StandardOutput, string StandardError);
+
+/// <summary>
+/// Stream passthrough options for <see cref="ProcessStreamEngine.RunWithStreamsAsync"/>.
+/// </summary>
+public sealed record ProcessStreamOptions
+{
+	public Stream? StandardInput { get; init; }
+	public Stream? StandardOutput { get; init; }
+	public Stream? StandardError { get; init; }
+	public bool MonitorStderrAsLines { get; init; }
+	public bool LeaveStreamsOpen { get; init; }
+}
+
+/// <summary>
 /// Takes a process that was started and watches the output for "events" and "data" that can be captured and processed.
 /// Events would be delegates that are invoked when certain output is detected via Regex or string matching.
 /// Data could also be captured via Regex and stored for later retrieval.
@@ -24,17 +57,17 @@ public class ProcessStreamEngine : IDisposable
 	/// <summary>
 	/// When true, the process is started by <see cref="StartMonitoringAsync"/> rather than at construction.
 	/// </summary>
-	private readonly bool deferredStart;
+	private readonly bool DeferredStart;
 
 	/// <summary>
 	/// Whether <see cref="EnsureProcessStarted"/> has been called.
 	/// </summary>
-	private bool processStarted;
+	private bool ProcessStarted;
 
 	/// <summary>
 	/// Command line for deferred Instance.Start when using <see cref="CreateDeferredFromInstance"/>.
 	/// </summary>
-	private readonly (string FileName, string Arguments)? deferredInstanceStart;
+	private readonly (string FileName, string Arguments)? DeferredInstanceStart;
 
 	/// <summary>
 	/// The IProcessInstance if created from Instances library, null otherwise.
@@ -60,12 +93,12 @@ public class ProcessStreamEngine : IDisposable
 	/// <summary>
 	/// Backing field for StreamToConsole property.
 	/// </summary>
-	protected bool streamToConsole = false;
+	protected bool StreamToConsoleBacking = false;
 
 	/// <summary>
 	/// Track whether the instance has been disposed.
 	/// </summary>
-	private bool _disposed = false;
+	private bool Disposed = false;
 
 
 	/// <summary>
@@ -78,9 +111,29 @@ public class ProcessStreamEngine : IDisposable
 	/// </summary>
 	public bool StreamToConsole
 	{
-		get => streamToConsole;
-		set => streamToConsole = value;
+		get => StreamToConsoleBacking;
+		set => StreamToConsoleBacking = value;
 	}
+
+	/// <summary>
+	/// Gets stdout lines accumulated during line monitoring, in order.
+	/// </summary>
+	public IReadOnlyList<string> StdoutLines => StdoutMonitor.OrderedLines;
+
+	/// <summary>
+	/// Gets stderr lines accumulated during line monitoring, in order.
+	/// </summary>
+	public IReadOnlyList<string> StderrLines => StderrMonitor.OrderedLines;
+
+	/// <summary>
+	/// Gets stdout text joined with <see cref="Environment.NewLine"/>.
+	/// </summary>
+	public string StdoutText => StdoutMonitor.GetJoinedText();
+
+	/// <summary>
+	/// Gets stderr text joined with <see cref="Environment.NewLine"/>.
+	/// </summary>
+	public string StderrText => StderrMonitor.GetJoinedText();
 
 	/// <summary>
 	/// Gets all captured data entries for all patterns.
@@ -102,14 +155,14 @@ public class ProcessStreamEngine : IDisposable
 	/// </summary>
 	protected void StreamLineToConsole(string line, bool isErrorStream)
 	{
-		if (!streamToConsole && ConsoleStreamHandler == null) 
+		if (!StreamToConsoleBacking && ConsoleStreamHandler == null) 
 			return;
 
 		if (ConsoleStreamHandler != null)
 		{
 			ConsoleStreamHandler(line, isErrorStream);
 		}
-		else if (streamToConsole)
+		else if (StreamToConsoleBacking)
 		{
 			if (isErrorStream)
 				Console.Error.WriteLine(line);
@@ -133,7 +186,7 @@ public class ProcessStreamEngine : IDisposable
 			throw new ArgumentException("Process must have RedirectStandardOutput and RedirectStandardError set to true.", nameof(process));
 		}
 
-		processStarted = true;
+		ProcessStarted = true;
 	}
 
 	/// <summary>
@@ -154,7 +207,7 @@ public class ProcessStreamEngine : IDisposable
 
 		ProcessInstance = processInstance;
 		Process = ExtractProcessFromInstance(processInstance);
-		processStarted = true;
+		ProcessStarted = true;
 	}
 
 	/// <summary>
@@ -174,6 +227,260 @@ public class ProcessStreamEngine : IDisposable
 	public static ProcessStreamEngine CreateDeferredFromInstance(string fileName, string arguments = "") =>
 		new(fileName, arguments);
 
+	/// <summary>
+	/// Runs a process and returns buffered stdout/stderr text. Does not throw on non-zero exit.
+	/// </summary>
+	public static async Task<ProcessTextResult> RunTextAsync(
+		ProcessStartInfo startInfo,
+		CancellationToken cancellationToken = default,
+		int? timeoutMs = null)
+	{
+		ArgumentNullException.ThrowIfNull(startInfo);
+
+		startInfo.UseShellExecute = false;
+		startInfo.RedirectStandardOutput = true;
+		startInfo.RedirectStandardError = true;
+
+		using var engine = CreateDeferred(startInfo);
+		await engine.StartMonitoringAsync(cancellationToken);
+		var exitCode = await engine.WaitForExitAsync(cancellationToken, timeoutMs ?? 30000);
+		return new ProcessTextResult(exitCode, engine.StdoutText, engine.StderrText);
+	}
+
+	/// <summary>
+	/// Runs a process and returns buffered stdout/stderr text. Throws <see cref="ProcessStreamEngineException"/> on non-zero exit.
+	/// </summary>
+	public static async Task<ProcessTextResult> RunTextOrThrowAsync(
+		ProcessStartInfo startInfo,
+		CancellationToken cancellationToken = default,
+		int? timeoutMs = null)
+	{
+		var result = await RunTextAsync(startInfo, cancellationToken, timeoutMs);
+		if (result.ExitCode != 0)
+			throw new ProcessStreamEngineException(result.ExitCode, result.StandardError);
+
+		return result;
+	}
+
+	/// <summary>
+	/// Runs a process with raw byte-stream passthrough for stdin/stdout/stderr.
+	/// </summary>
+	public static async Task<int> RunWithStreamsAsync(
+		ProcessStartInfo startInfo,
+		ProcessStreamOptions options,
+		CancellationToken cancellationToken = default,
+		int? timeoutMs = null)
+	{
+		ArgumentNullException.ThrowIfNull(startInfo);
+		ArgumentNullException.ThrowIfNull(options);
+
+		if (options.StandardError != null && options.MonitorStderrAsLines)
+		{
+			throw new ArgumentException(
+				"StandardError stream and MonitorStderrAsLines are mutually exclusive.",
+				nameof(options));
+		}
+
+		startInfo.UseShellExecute = false;
+
+		if (options.StandardInput != null)
+			startInfo.RedirectStandardInput = true;
+		if (options.StandardOutput != null)
+			startInfo.RedirectStandardOutput = true;
+		if (options.StandardError != null || options.MonitorStderrAsLines)
+			startInfo.RedirectStandardError = true;
+
+		using var process = new Process { StartInfo = startInfo };
+		process.Start();
+
+		using var timeoutCts = timeoutMs.HasValue ? new CancellationTokenSource(timeoutMs.Value) : null;
+		using var linkedCts = timeoutCts != null
+			? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+			: null;
+		var token = linkedCts?.Token ?? cancellationToken;
+
+		var stderrLines = new List<string>();
+		var copyTasks = new List<Task>();
+
+		if (options.StandardInput != null)
+		{
+			copyTasks.Add(CopyToProcessStdinAsync(
+				options.StandardInput,
+				process,
+				options.LeaveStreamsOpen,
+				token));
+		}
+
+		if (options.StandardOutput != null)
+		{
+			copyTasks.Add(CopyFromProcessStreamAsync(
+				process.StandardOutput.BaseStream,
+				options.StandardOutput,
+				options.LeaveStreamsOpen,
+				token));
+		}
+
+		if (options.StandardError != null)
+		{
+			copyTasks.Add(CopyFromProcessStreamAsync(
+				process.StandardError.BaseStream,
+				options.StandardError,
+				options.LeaveStreamsOpen,
+				token));
+		}
+		else if (options.MonitorStderrAsLines)
+		{
+			copyTasks.Add(MonitorStderrAsLinesAsync(process.StandardError, stderrLines, token));
+		}
+
+		try
+		{
+			await process.WaitForExitAsync(token);
+			await Task.WhenAll(copyTasks);
+
+			var exitCode = process.ExitCode;
+
+			if (options.MonitorStderrAsLines && exitCode != 0)
+			{
+				throw new ProcessStreamEngineException(
+					exitCode,
+					string.Join(Environment.NewLine, stderrLines));
+			}
+
+			return exitCode;
+		}
+		catch (OperationCanceledException) when (token.IsCancellationRequested)
+		{
+			KillProcessIfRunning(process);
+			throw;
+		}
+	}
+
+	/// <summary>
+	/// Creates a <see cref="ProcessStartInfo"/> with shell execution disabled and arguments populated via <see cref="ProcessStartInfo.ArgumentList"/>.
+	/// </summary>
+	public static ProcessStartInfo CreateStartInfo(
+		string fileName,
+		IEnumerable<string> arguments,
+		string? workingDirectory = null)
+	{
+		if (string.IsNullOrWhiteSpace(fileName))
+			throw new ArgumentException("File name cannot be null or empty.", nameof(fileName));
+		ArgumentNullException.ThrowIfNull(arguments);
+
+		var startInfo = new ProcessStartInfo
+		{
+			FileName = fileName,
+			UseShellExecute = false
+		};
+
+		foreach (var argument in arguments)
+			startInfo.ArgumentList.Add(argument);
+
+		if (workingDirectory != null)
+			startInfo.WorkingDirectory = workingDirectory;
+
+		return startInfo;
+	}
+
+	/// <summary>
+	/// Applies environment variables to a <see cref="ProcessStartInfo"/>. Null values remove the variable.
+	/// </summary>
+	public static void ApplyEnvironment(
+		ProcessStartInfo startInfo,
+		IReadOnlyDictionary<string, string?> variables)
+	{
+		ArgumentNullException.ThrowIfNull(startInfo);
+		ArgumentNullException.ThrowIfNull(variables);
+
+		foreach (var (key, value) in variables)
+		{
+			if (value is null)
+				startInfo.Environment.Remove(key);
+			else
+				startInfo.Environment[key] = value;
+		}
+	}
+
+	private static async Task CopyToProcessStdinAsync(
+		Stream source,
+		Process process,
+		bool leaveStreamsOpen,
+		CancellationToken cancellationToken)
+	{
+		try
+		{
+			await source.CopyToAsync(process.StandardInput.BaseStream, cancellationToken);
+		}
+		finally
+		{
+			process.StandardInput.Close();
+
+			if (!leaveStreamsOpen)
+				source.Dispose();
+		}
+	}
+
+	private static async Task CopyFromProcessStreamAsync(
+		Stream source,
+		Stream destination,
+		bool leaveStreamsOpen,
+		CancellationToken cancellationToken)
+	{
+		await source.CopyToAsync(destination, cancellationToken);
+
+		if (!leaveStreamsOpen)
+			await destination.DisposeAsync();
+	}
+
+	private static async Task MonitorStderrAsLinesAsync(
+		StreamReader stderr,
+		List<string> stderrLines,
+		CancellationToken cancellationToken)
+	{
+		try
+		{
+			while (!cancellationToken.IsCancellationRequested)
+			{
+				var line = await ReadLineAsync(stderr, cancellationToken);
+				if (line is null)
+					break;
+
+				lock (stderrLines)
+					stderrLines.Add(line);
+			}
+		}
+		catch (OperationCanceledException)
+		{
+			// Expected when cancelled
+		}
+	}
+
+	private static void KillProcessIfRunning(Process process)
+	{
+		if (process.HasExited)
+			return;
+
+		try
+		{
+			process.Kill(entireProcessTree: true);
+		}
+		catch
+		{
+			// Process may have exited or already killed
+		}
+	}
+
+	private static async Task<string?> ReadLineAsync(StreamReader reader, CancellationToken cancellationToken)
+	{
+#if NET7_0_OR_GREATER
+		return await reader.ReadLineAsync(cancellationToken);
+#else
+		cancellationToken.ThrowIfCancellationRequested();
+		return await reader.ReadLineAsync();
+#endif
+	}
+
 	private ProcessStreamEngine(ProcessStartInfo startInfo)
 	{
 		ArgumentNullException.ThrowIfNull(startInfo);
@@ -186,7 +493,7 @@ public class ProcessStreamEngine : IDisposable
 		}
 
 		Process = new Process { StartInfo = startInfo };
-		deferredStart = true;
+		DeferredStart = true;
 	}
 
 	private ProcessStreamEngine(string fileName, string arguments)
@@ -194,17 +501,17 @@ public class ProcessStreamEngine : IDisposable
 		if (string.IsNullOrWhiteSpace(fileName))
 			throw new ArgumentException("File name cannot be null or empty.", nameof(fileName));
 
-		deferredInstanceStart = (fileName, arguments ?? string.Empty);
-		deferredStart = true;
+		DeferredInstanceStart = (fileName, arguments ?? string.Empty);
+		DeferredStart = true;
 		Process = null!;
 	}
 
 	private void EnsureProcessStarted()
 	{
-		if (processStarted)
+		if (ProcessStarted)
 			return;
 
-		if (deferredInstanceStart is { } cmd)
+		if (DeferredInstanceStart is { } cmd)
 		{
 			var instance = Instance.Start(cmd.FileName, cmd.Arguments);
 			ProcessInstance = instance;
@@ -215,7 +522,7 @@ public class ProcessStreamEngine : IDisposable
 			Process.Start();
 		}
 
-		processStarted = true;
+		ProcessStarted = true;
 	}
 
 	/// <summary>
@@ -380,6 +687,9 @@ public class ProcessStreamEngine : IDisposable
 	/// <returns>A task that completes when monitoring is set up (or drained for an already-exited process).</returns>
 	public async Task StartMonitoringAsync(CancellationToken cancellationToken = default)
 	{
+		StdoutMonitor.ClearOrderedLines();
+		StderrMonitor.ClearOrderedLines();
+
 		EnsureProcessStarted();
 
 		var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(CancellationTokenSource.Token, cancellationToken);
@@ -486,7 +796,7 @@ public class ProcessStreamEngine : IDisposable
 		{
 			while (!cancellationToken.IsCancellationRequested)
 			{
-				var line = await reader.ReadLineAsync(cancellationToken);
+				var line = await ReadLineAsync(reader, cancellationToken);
 				if (line == null)
 					break;
 
@@ -510,6 +820,7 @@ public class ProcessStreamEngine : IDisposable
 	{
 		var monitor = GetMonitor(isErrorStream);
 		monitor.RecentLines.Add(line);
+		monitor.AddOrderedLine(line);
 		StreamLineToConsole(line, isErrorStream);
 		await ProcessLineAsync(line, isErrorStream);
 	}
@@ -971,7 +1282,7 @@ public class ProcessStreamEngine : IDisposable
 	[UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "IProcessInstance implementations are known and preserved")]
 	public async Task SendInputAsync(string input, CancellationToken cancellationToken = default)
 	{
-		if (deferredStart && !processStarted)
+		if (DeferredStart && !ProcessStarted)
 			throw new InvalidOperationException("Process has not been started. Call StartMonitoringAsync() first.");
 
 		if (Process.HasExited)
@@ -1000,6 +1311,28 @@ public class ProcessStreamEngine : IDisposable
 	}
 
 	/// <summary>
+	/// Sends raw bytes to the process standard input stream without appending a newline.
+	/// </summary>
+	/// <param name="data">The raw bytes to send.</param>
+	/// <param name="cancellationToken">Optional cancellation token.</param>
+	/// <returns>A task representing the async operation.</returns>
+	/// <exception cref="InvalidOperationException">Thrown when process input is not redirected.</exception>
+	public async Task SendRawInputAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+	{
+		if (DeferredStart && !ProcessStarted)
+			throw new InvalidOperationException("Process has not been started. Call StartMonitoringAsync() first.");
+
+		if (Process.HasExited)
+			throw new InvalidOperationException("Process has already exited.");
+
+		if (!Process.StartInfo.RedirectStandardInput)
+			throw new InvalidOperationException("Process input is not redirected. Set RedirectStandardInput to true.");
+
+		await Process.StandardInput.BaseStream.WriteAsync(data, cancellationToken);
+		await Process.StandardInput.FlushAsync();
+	}
+
+	/// <summary>
 	/// Waits for the process to exit and completes monitoring.
 	/// </summary>
 	/// <param name="cancellationToken">Optional cancellation token.</param>
@@ -1008,7 +1341,7 @@ public class ProcessStreamEngine : IDisposable
 	[UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "IProcessInstance implementations are known and preserved")]
 	public async Task<int> WaitForExitAsync(CancellationToken cancellationToken = default, int timeoutMs = 30000)
 	{
-		if (deferredStart && !processStarted)
+		if (DeferredStart && !ProcessStarted)
 			throw new InvalidOperationException("Process has not been started. Call StartMonitoringAsync() first.");
 
 		using var timeoutCts = new CancellationTokenSource(timeoutMs);
@@ -1127,7 +1460,7 @@ public class ProcessStreamEngine : IDisposable
 		{
 			while (!cancellationToken.IsCancellationRequested && !Process.HasExited)
 			{
-				var line = await reader.ReadLineAsync(cancellationToken);
+				var line = await ReadLineAsync(reader, cancellationToken);
 				
 				if (line == null)
 				{
@@ -1267,16 +1600,37 @@ public class ProcessStreamEngine : IDisposable
 	/// </summary>
 	protected class StreamMonitor
 	{
+		private readonly object LinesLock = new();
+
 		public bool IsErrorStream { get; }
 		public ConcurrentDictionary<string, EventPattern> EventPatterns { get; } = new();
 		public ConcurrentDictionary<string, DataCapturePattern> DataPatterns { get; } = new();
 		public ConcurrentDictionary<string, ConcurrentBag<string>> CapturedData { get; } = new();
 		public ConcurrentDictionary<string, ConcurrentQueue<TaskCompletionSource<Match>>> EventWaiters { get; } = new();
 		public ConcurrentBag<string> RecentLines { get; } = new();
+		public List<string> OrderedLines { get; } = new();
 
 		public StreamMonitor(bool isErrorStream)
 		{
 			IsErrorStream = isErrorStream;
+		}
+
+		public void AddOrderedLine(string line)
+		{
+			lock (LinesLock)
+				OrderedLines.Add(line);
+		}
+
+		public void ClearOrderedLines()
+		{
+			lock (LinesLock)
+				OrderedLines.Clear();
+		}
+
+		public string GetJoinedText()
+		{
+			lock (LinesLock)
+				return string.Join(Environment.NewLine, OrderedLines);
 		}
 	}
 
@@ -1286,7 +1640,7 @@ public class ProcessStreamEngine : IDisposable
 	/// </summary>
 	public void Cleanup()
 	{
-		if (_disposed)
+		if (Disposed)
 			return;
 
 		StopMonitoring();
@@ -1309,11 +1663,11 @@ public class ProcessStreamEngine : IDisposable
 	/// </summary>
 	public void Dispose()
 	{
-		if (_disposed)
+		if (Disposed)
 			return;
 
 		Cleanup();
-		_disposed = true;
+		Disposed = true;
 		GC.SuppressFinalize(this);
 	}
 }

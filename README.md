@@ -14,6 +14,11 @@ Built for scenarios where you need more than `Process.StandardOutput.ReadToEnd()
 - **Interactive CLI support** — Send input, wait for prompts, and evaluate captured data before sending the next command.
 - **Conditional flows** — Wait for the first of several patterns and run the corresponding action.
 - **Console streaming** — Mirror output to the console or a custom handler.
+- **Buffered output** — Access full stdout/stderr as ordered line lists or joined text after monitoring.
+- **One-shot text runs** — `RunTextAsync` / `RunTextOrThrowAsync` run a process and return captured output without manual lifecycle management.
+- **Raw stream passthrough** — `RunWithStreamsAsync` pipes byte streams to/from stdin, stdout, and stderr for piping and proxy scenarios.
+- **Raw stdin** — `SendRawInputAsync` writes bytes to stdin without appending a newline.
+- **Process helpers** — `CreateStartInfo` and `ApplyEnvironment` simplify `ProcessStartInfo` setup with argument lists and env vars.
 - **Two integration modes** — Works with `System.Diagnostics.Process` directly, or with the [Instances](https://www.nuget.org/packages/Instances) library for a simpler process-start API.
 
 ## Requirements
@@ -86,6 +91,62 @@ await engine.StartMonitoringAsync();
 await engine.WaitForExitAsync();
 ```
 
+### One-shot text capture (no engine lifecycle)
+
+For simple "run command, get output" scenarios, use the static helpers:
+
+```csharp
+var startInfo = ProcessStreamEngine.CreateStartInfo("git", ["status", "--short"]);
+
+var result = await ProcessStreamEngine.RunTextAsync(startInfo);
+Console.WriteLine($"Exit: {result.ExitCode}");
+Console.WriteLine(result.StandardOutput);
+
+// Throws ProcessStreamEngineException (includes ExitCode and StandardError) on non-zero exit:
+var ok = await ProcessStreamEngine.RunTextOrThrowAsync(startInfo);
+```
+
+`RunTextAsync` does not throw on non-zero exit codes. `RunTextOrThrowAsync` throws `ProcessStreamEngineException` with the exit code and stderr text when the process fails.
+
+### Raw stream passthrough
+
+`RunWithStreamsAsync` copies bytes between your streams and the process — useful for piping, proxies, or forwarding output to a file or network stream:
+
+```csharp
+await using var input = File.OpenRead("commands.txt");
+await using var output = File.Create("result.txt");
+
+var startInfo = new ProcessStartInfo("my-tool", "--batch")
+{
+	WorkingDirectory = @"C:\tools"
+};
+
+ProcessStreamEngine.ApplyEnvironment(startInfo, new Dictionary<string, string?>
+{
+	["MY_VAR"] = "value",
+	["OLD_VAR"] = null  // removes the variable
+});
+
+var exitCode = await ProcessStreamEngine.RunWithStreamsAsync(
+	startInfo,
+	new ProcessStreamOptions
+	{
+		StandardInput = input,
+		StandardOutput = output,
+		MonitorStderrAsLines = true  // collect stderr; throws on non-zero exit
+	});
+```
+
+| `ProcessStreamOptions` | Description |
+|---|---|
+| `StandardInput` | Bytes copied to the process stdin (enables `RedirectStandardInput`). |
+| `StandardOutput` | Process stdout copied here (enables `RedirectStandardOutput`). |
+| `StandardError` | Process stderr copied here (enables `RedirectStandardError`). |
+| `MonitorStderrAsLines` | Line-buffer stderr instead of copying to a stream. On non-zero exit, throws `ProcessStreamEngineException` with joined stderr. Mutually exclusive with `StandardError`. |
+| `LeaveStreamsOpen` | When false (default), provided streams are disposed after the run. |
+
+Only streams you supply are redirected. Omitted streams are not read or written.
+
 ## Core Concepts
 
 ### Lifecycle
@@ -139,6 +200,22 @@ await engine.WaitForExitAsync();
 Events are for side effects (logging, state changes, triggering logic). Data capture is for collecting values you will read later.
 
 Both support matching on stdout (default) or stderr via `matchOnErrorStream: true`.
+
+### Buffered Output
+
+While monitoring, every line read from stdout and stderr is stored in order. After `StartMonitoringAsync()` (and once output has been processed), you can read the full transcript without re-parsing captured data:
+
+```csharp
+await engine.StartMonitoringAsync();
+await engine.WaitForExitAsync();
+
+var lines = engine.StdoutLines;           // IReadOnlyList<string>, in order
+var text = engine.StdoutText;             // lines joined with Environment.NewLine
+var errors = engine.StderrLines;
+var errorText = engine.StderrText;
+```
+
+Buffered output is cleared when `StartMonitoringAsync()` is called again on the same engine instance.
 
 ### Waiting for Output
 
@@ -272,7 +349,49 @@ var (match, patternName) = await engine.WaitForAnyConditionAsync(
 ]);
 ```
 
+### Read full output after monitoring
+
+```csharp
+using var engine = ProcessStreamEngine.CreateDeferredFromInstance("ping", "-n 2 127.0.0.1");
+
+await engine.StartMonitoringAsync();
+var exitCode = await engine.WaitForExitAsync();
+
+if (exitCode != 0)
+	Console.Error.WriteLine(engine.StderrText);
+
+foreach (var line in engine.StdoutLines)
+	Console.WriteLine(line);
+```
+
+### Send raw bytes to stdin
+
+When a tool expects binary or partial input (no trailing newline), use `SendRawInputAsync` instead of `SendInputAsync`:
+
+```csharp
+await engine.SendRawInputAsync(Encoding.UTF8.GetBytes("partial"));
+await engine.SendRawInputAsync("\n"u8.ToArray());  // newline only when you want it
+```
+
 ## API Reference
+
+### Types
+
+| Type | Description |
+|---|---|
+| `ProcessTextResult` | Record: `ExitCode`, `StandardOutput`, `StandardError` — returned by `RunTextAsync` / `RunTextOrThrowAsync`. |
+| `ProcessStreamOptions` | Options for `RunWithStreamsAsync`: optional stdin/stdout/stderr streams, `MonitorStderrAsLines`, `LeaveStreamsOpen`. |
+| `ProcessStreamEngineException` | Thrown on non-zero exit when stderr is available (`RunTextOrThrowAsync`, `RunWithStreamsAsync` with `MonitorStderrAsLines`). Exposes `ExitCode` and `StandardError`. |
+
+### Static Helpers
+
+| Method | Description |
+|---|---|
+| `RunTextAsync(startInfo, cancellationToken?, timeoutMs?)` | Run process, return buffered stdout/stderr. Does not throw on non-zero exit. |
+| `RunTextOrThrowAsync(startInfo, cancellationToken?, timeoutMs?)` | Same as `RunTextAsync`; throws `ProcessStreamEngineException` on non-zero exit. |
+| `RunWithStreamsAsync(startInfo, options, cancellationToken?, timeoutMs?)` | Byte-stream passthrough; returns exit code. |
+| `CreateStartInfo(fileName, arguments, workingDirectory?)` | `ProcessStartInfo` with `UseShellExecute = false` and `ArgumentList` populated. |
+| `ApplyEnvironment(startInfo, variables)` | Set or remove environment variables (`null` value removes the key). |
 
 ### Construction
 
@@ -300,6 +419,7 @@ Multiple handlers can be registered under the same event name; all are invoked o
 | `StartMonitoringAsync(cancellationToken?)` | Begin reading process output. Drains remaining output if the process has already exited. |
 | `StopMonitoring()` | Cancel monitoring tasks. |
 | `SendInputAsync(input, cancellationToken?)` | Write a line to stdin (appends newline if missing). |
+| `SendRawInputAsync(data, cancellationToken?)` | Write raw bytes to stdin without appending a newline. |
 | `WaitForExitAsync(cancellationToken?, timeoutMs?)` | Wait for process exit, stop monitoring, return exit code. |
 
 ### Waiting
@@ -324,6 +444,10 @@ Multiple handlers can be registered under the same event name; all are invoked o
 
 | Member | Description |
 |---|---|
+| `StdoutLines` | Ordered stdout lines accumulated during line monitoring. |
+| `StderrLines` | Ordered stderr lines accumulated during line monitoring. |
+| `StdoutText` | `StdoutLines` joined with `Environment.NewLine`. |
+| `StderrText` | `StderrLines` joined with `Environment.NewLine`. |
 | `StreamToConsole` | When true, writes output lines to `Console` / `Console.Error`. |
 | `ConsoleStreamHandler` | Custom `(line, isErrorStream) => void` handler; takes precedence over `StreamToConsole`. |
 
@@ -350,15 +474,21 @@ Multiple handlers can be registered under the same event name; all are invoked o
 
 **Thread safety.** Event handlers run on thread-pool threads via `Task.Run`. Keep handlers short or marshal back to your synchronization context if updating UI state.
 
+**Choose the right API for your scenario.** Use `RunTextAsync` for fire-and-forget command output. Use `RunWithStreamsAsync` when you need byte-level piping. Use a `ProcessStreamEngine` instance when you need events, data capture, prompts, or interactive flows.
+
+**`MonitorStderrAsLines` vs `StandardError`.** You cannot set both. Use line monitoring when you only need stderr for error reporting on failure; use a stream when you need to forward stderr elsewhere.
+
+**Stream disposal in `RunWithStreamsAsync`.** By default, streams passed in `ProcessStreamOptions` are disposed when the run completes. Set `LeaveStreamsOpen = true` if the caller owns the stream lifetime.
+
 ## Project Structure
 
 ```
 ProcessStreamEngine/
-├── ProcessStreamEngine.cs          # Main library (single public class)
-├── ProcessStreamEngine.csproj  # .NET 9 class library
+├── ProcessStreamEngine.cs      # Main library (ProcessStreamEngine + helper types)
+├── ProcessStreamEngine.csproj  # .NET class library
 └── README.md
 ```
 
 ## Related Tests
 
-See `ProcessStreamEngine.Tests` in the parent solution for integration tests covering ping data capture, nslookup interaction, prompt handling, conditional flows, and error cases.
+See `Source/ProcessStreamEngine.Tests` for unit tests covering buffered text execution, stream passthrough, event/capture handling, interactive input, and error cases.

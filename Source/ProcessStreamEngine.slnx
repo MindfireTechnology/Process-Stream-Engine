@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ProcessStreamEngine/ProcessStreamEngine.csproj" />
+  <Project Path="ProcessStreamEngine.Tests/ProcessStreamEngine.Tests.csproj" />
+</Solution>

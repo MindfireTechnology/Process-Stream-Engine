@@ -483,9 +483,13 @@ Multiple handlers can be registered under the same event name; all are invoked o
 ## Project Structure
 
 ```
-ProcessStreamEngine/
-├── ProcessStreamEngine.cs      # Main library (ProcessStreamEngine + helper types)
-├── ProcessStreamEngine.csproj  # .NET class library
+Process-Stream-Engine/
+├── Source/
+│   ├── ProcessStreamEngine.slnx
+│   ├── ProcessStreamEngine/
+│   │   ├── ProcessStreamEngine.cs      # Main library
+│   │   └── ProcessStreamEngine.csproj
+│   └── ProcessStreamEngine.Tests/      # Unit tests
 └── README.md
 ```
 

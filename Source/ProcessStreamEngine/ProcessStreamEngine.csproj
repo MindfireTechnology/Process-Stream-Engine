@@ -1,6 +1,6 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net10.0;net9.0;net8.0;net7.0;net6.0;net5.0;net4.8;</TargetFrameworks>
+    <TargetFrameworks>net10.0;net9.0;net8.0;net7.0;net6.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
@@ -25,21 +25,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="ProcessStreamEngine.Tests/**" />
-    <None Remove="ProcessStreamEngine.Tests/**" />
-    <Content Remove="ProcessStreamEngine.Tests/**" />
-    <EmbeddedResource Remove="ProcessStreamEngine.Tests/**" />
-  </ItemGroup>
-
-  <ItemGroup>
     <PackageReference Include="Instances" Version="3.0.2" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\Resources\Mindfire-Logo.png" Pack="true" PackagePath="\" />
-    <None Include="..\README.md" Pack="true" PackagePath="\" />
-    <None Include="..\LICENSE" Pack="true" PackagePath="\" />
+    <None Include="..\..\Resources\Mindfire-Logo.png" Pack="true" PackagePath="\" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>
 

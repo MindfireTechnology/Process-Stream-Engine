@@ -121,7 +121,7 @@ public class WaitForAnyConditionTests
 	public async Task WaitForAnyConditionAsync_RunsFirstMatchingAction()
 	{
 		using var engine = ProcessTestHarness.CreateDeferredEngine(ShellCommand.Echo("branch: main"));
-		var actionRan = false;
+		var actionRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
 		var waitTask = engine.WaitForAnyConditionAsync(
 		[
@@ -131,7 +131,7 @@ public class WaitForAnyConditionTests
 				Pattern = @"branch: (\w+)",
 				Action = (_, _) =>
 				{
-					actionRan = true;
+					actionRan.TrySetResult();
 					return Task.CompletedTask;
 				}
 			}
@@ -142,6 +142,7 @@ public class WaitForAnyConditionTests
 		await waitTask;
 		await engine.WaitForExitAsync();
 
-		actionRan.ShouldBeTrue();
+		// The action is started fire-and-forget once the pattern matches, so wait for it instead of assuming it already ran.
+		await actionRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
 	}
 }

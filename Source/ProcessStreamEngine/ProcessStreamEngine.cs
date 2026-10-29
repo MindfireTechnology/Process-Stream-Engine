@@ -772,15 +772,17 @@ public class ProcessStreamEngine : IDisposable
 		var outputDataProperty = ProcessInstance!.GetType().GetProperty("OutputData");
 		var errorDataProperty = ProcessInstance.GetType().GetProperty("ErrorData");
 
+		try
+		{
+			// OutputData/ErrorData are only complete once Instances has read both streams to end-of-stream.
+			await ProcessInstance.WaitForExitAsync(CancellationToken.None).WaitAsync(token);
+		}
+		catch (OperationCanceledException)
+		{
+			// Expected when cancelled - process whatever has arrived
+		}
+
 		await ProcessExistingInstanceDataAsync(outputDataProperty, errorDataProperty);
-
-		var lastOutputCount = GetDataListCount(outputDataProperty, ProcessInstance);
-		var lastErrorCount = GetDataListCount(errorDataProperty, ProcessInstance);
-
-		lastOutputCount = await ProcessNewInstanceDataAsync(
-			outputDataProperty, ProcessInstance, lastOutputCount, isErrorStream: false);
-		lastErrorCount = await ProcessNewInstanceDataAsync(
-			errorDataProperty, ProcessInstance, lastErrorCount, isErrorStream: true);
 
 		var completedTask = Task.CompletedTask;
 		MonitoringTasks.Add(completedTask);
@@ -834,30 +836,22 @@ public class ProcessStreamEngine : IDisposable
 		var outputDataProperty = ProcessInstance!.GetType().GetProperty("OutputData");
 		var errorDataProperty = ProcessInstance.GetType().GetProperty("ErrorData");
 
-		// Process any existing data immediately
-		await ProcessExistingInstanceDataAsync(outputDataProperty, errorDataProperty);
+		// Process any existing data immediately, then poll from where that left off
+		var lastOutputCount = await ProcessNewInstanceDataAsync(
+			outputDataProperty, ProcessInstance, 0, isErrorStream: false);
+		var lastErrorCount = await ProcessNewInstanceDataAsync(
+			errorDataProperty, ProcessInstance, 0, isErrorStream: true);
 
-		if (Process.HasExited)
-		{
-			var lastOutputCount = GetDataListCount(outputDataProperty, ProcessInstance);
-			var lastErrorCount = GetDataListCount(errorDataProperty, ProcessInstance);
-			await ProcessNewInstanceDataAsync(
-				outputDataProperty, ProcessInstance, lastOutputCount, isErrorStream: false);
-			await ProcessNewInstanceDataAsync(
-				errorDataProperty, ProcessInstance, lastErrorCount, isErrorStream: true);
-			MonitoringTasks.Add(Task.CompletedTask);
-			return;
-		}
+		// Completes once Instances has read both streams to end-of-stream. Process.HasExited can be true
+		// before that, with lines still to arrive in OutputData/ErrorData.
+		var outputCompleted = ProcessInstance.WaitForExitAsync(CancellationToken.None);
 
 		// Start polling task for new data
 		var monitorTask = Task.Run(async () =>
 		{
-			var lastOutputCount = GetDataListCount(outputDataProperty, ProcessInstance);
-			var lastErrorCount = GetDataListCount(errorDataProperty, ProcessInstance);
-
 			try
 			{
-				while (!token.IsCancellationRequested && !Process.HasExited)
+				while (!token.IsCancellationRequested && !outputCompleted.IsCompleted)
 				{
 					// Check for new output data
 					lastOutputCount = await ProcessNewInstanceDataAsync(
@@ -871,7 +865,7 @@ public class ProcessStreamEngine : IDisposable
 					await Task.Delay(10, token);
 				}
 
-				// Process any remaining data after process exits
+				// Process any remaining data after both streams have ended
 				await ProcessNewInstanceDataAsync(outputDataProperty, ProcessInstance, lastOutputCount, isErrorStream: false);
 				await ProcessNewInstanceDataAsync(errorDataProperty, ProcessInstance, lastErrorCount, isErrorStream: true);
 			}
@@ -982,18 +976,6 @@ public class ProcessStreamEngine : IDisposable
 				await ProcessLineAsync(line, isErrorStream);
 			}
 		}
-	}
-
-	/// <summary>
-	/// Gets the count of items in a data list property, or 0 if unavailable.
-	/// </summary>
-	private static int GetDataListCount(PropertyInfo? dataProperty, IProcessInstance instance)
-	{
-		if (dataProperty != null && dataProperty.GetValue(instance) is IList<string> list)
-		{
-			return list.Count;
-		}
-		return 0;
 	}
 
 
@@ -1333,12 +1315,13 @@ public class ProcessStreamEngine : IDisposable
 	}
 
 	/// <summary>
-	/// Waits for the process to exit and completes monitoring.
+	/// Waits for the process to exit and for monitoring to finish. Returns only after stdout and stderr have been
+	/// read to end-of-stream and every handler call for their lines has completed.
 	/// </summary>
 	/// <param name="cancellationToken">Optional cancellation token.</param>
-	/// <param name="timeoutMs">Optional timeout in milliseconds. Default is 30000 (30 seconds).</param>
+	/// <param name="timeoutMs">Optional timeout in milliseconds, covering both the exit and draining the output. Default is 30000 (30 seconds).</param>
 	/// <returns>The exit code of the process.</returns>
-	[UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "IProcessInstance implementations are known and preserved")]
+	/// <exception cref="TimeoutException">Thrown when the process does not exit, or its output streams do not close, within the timeout.</exception>
 	public async Task<int> WaitForExitAsync(CancellationToken cancellationToken = default, int timeoutMs = 30000)
 	{
 		if (DeferredStart && !ProcessStarted)
@@ -1347,92 +1330,38 @@ public class ProcessStreamEngine : IDisposable
 		using var timeoutCts = new CancellationTokenSource(timeoutMs);
 		using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 		var combinedToken = linkedCts.Token;
+		int? instanceExitCode = null;
+		var exitObserved = false;
 
 		try
 		{
-			// Check if already exited
-			if (Process.HasExited)
+			if (!Process.HasExited)
 			{
-				StopMonitoring();
-				await Task.WhenAll(MonitoringTasks);
-				return Process.ExitCode;
-			}
-
-			// If using IProcessInstance, try its WaitForExitAsync method, but fallback to polling if needed
-			if (ProcessInstance != null)
-			{
-				var waitForExitMethod = ProcessInstance.GetType().GetMethod("WaitForExitAsync", new[] { typeof(CancellationToken) });
-				if (waitForExitMethod != null)
+				if (ProcessInstance != null)
 				{
-					try
-					{
-						var resultTask = waitForExitMethod.Invoke(ProcessInstance, new object[] { combinedToken });
-						if (resultTask is Task task)
-						{
-							// Use Task.WhenAny to add timeout protection
-							var timeoutTask = Task.Delay(timeoutMs, combinedToken);
-							var completedTask = await Task.WhenAny(task, timeoutTask);
-							
-							if (completedTask == timeoutTask)
-							{
-								throw new TimeoutException($"Process did not exit within {timeoutMs}ms timeout.");
-							}
-							
-							await task;
-							
-							// Wait a bit for monitoring task to process final data
-							await Task.Delay(200);
-							StopMonitoring();
-							await Task.WhenAll(MonitoringTasks);
-							
-							// Try to get exit code from result
-							if (task.GetType().IsGenericType)
-							{
-								var resultProperty = task.GetType().GetProperty("Result");
-								if (resultProperty != null)
-								{
-									var result = resultProperty.GetValue(task);
-									if (result != null)
-									{
-										var exitCodeProperty = result.GetType().GetProperty("ExitCode");
-										if (exitCodeProperty != null)
-										{
-											return (int)exitCodeProperty.GetValue(result)!;
-										}
-									}
-								}
-							}
-						}
-						else
-						{
-							// Method returned void, wait for process with timeout
-							await Process.WaitForExitAsync(combinedToken);
-						}
-					}
-					catch (Exception)
-					{
-						// If reflection-based approach fails, fall back to Process.WaitForExitAsync
-						await Process.WaitForExitAsync(combinedToken);
-					}
+					// Instances kills the process when the token is cancelled and then completes normally,
+					// so WaitAsync is what turns a timeout into a cancellation here.
+					var result = await ProcessInstance.WaitForExitAsync(combinedToken).WaitAsync(combinedToken);
+					instanceExitCode = result.ExitCode;
 				}
 				else
 				{
-					// No WaitForExitAsync method, use Process directly with timeout
 					await Process.WaitForExitAsync(combinedToken);
 				}
 			}
-			else
-			{
-				// Fallback to direct Process access with timeout
-				await Process.WaitForExitAsync(combinedToken);
-			}
+
+			exitObserved = true;
+
+			// Exit can be observed while output is still buffered in the pipes. Do not cancel monitoring here:
+			// let it read both streams to end-of-stream and finish every handler call first.
+			await Task.WhenAll(MonitoringTasks).WaitAsync(combinedToken);
 		}
 		catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
 		{
 			// Timeout occurred - force stop monitoring and kill process if needed
 			StopMonitoring();
 			await Task.WhenAll(MonitoringTasks);
-			
+
 			if (!Process.HasExited)
 			{
 				try
@@ -1445,13 +1374,14 @@ public class ProcessStreamEngine : IDisposable
 					// Process may have exited or already killed
 				}
 			}
-			
-			throw new TimeoutException($"Process did not exit within {timeoutMs}ms timeout.");
+
+			throw new TimeoutException(exitObserved
+				? $"Process exited but its output streams did not close within {timeoutMs}ms timeout."
+				: $"Process did not exit within {timeoutMs}ms timeout.");
 		}
-		
+
 		StopMonitoring();
-		await Task.WhenAll(MonitoringTasks);
-		return Process.ExitCode;
+		return instanceExitCode ?? Process.ExitCode;
 	}
 
 	protected async Task MonitorStreamAsync(StreamReader reader, bool isErrorStream, CancellationToken cancellationToken)

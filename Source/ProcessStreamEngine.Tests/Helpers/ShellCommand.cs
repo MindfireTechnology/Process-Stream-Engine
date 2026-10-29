@@ -31,6 +31,14 @@ internal static class ShellCommand
 			? ["/c", $"echo {message} 1>&2 & exit /b {code}"]
 			: ["-c", $"echo {message} >&2; exit {code}"];
 
+	/// <summary>
+	/// Writes out-1..out-N to stdout and err-1..err-N to stderr, interleaved, then exits.
+	/// </summary>
+	public static IReadOnlyList<string> EchoNumberedLines(int count) =>
+		OperatingSystem.IsWindows()
+			? ["/c", $"for /L %i in (1,1,{count}) do @(echo out-%i&>&2 echo err-%i)"]
+			: ["-c", $"i=1; while [ $i -le {count} ]; do echo out-$i; echo err-$i >&2; i=$((i+1)); done"];
+
 	public static IReadOnlyList<string> SleepForever() =>
 		OperatingSystem.IsWindows()
 			? ["/c", "ping", "127.0.0.1", "-n", "61", ">", "nul"]

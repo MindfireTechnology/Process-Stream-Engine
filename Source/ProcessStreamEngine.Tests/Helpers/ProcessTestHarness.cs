@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using FakeItEasy;
 
 namespace ProcessStreamEngine.Tests.Helpers;
 
@@ -7,52 +6,24 @@ internal static class ProcessTestHarness
 {
 	public static ProcessStartInfo CreateRedirectedStartInfo(IEnumerable<string> arguments, bool redirectInput = false)
 	{
-		var startInfo = ProcessStreamEngine.CreateStartInfo(ShellCommand.Executable, arguments);
-		startInfo.RedirectStandardOutput = true;
-		startInfo.RedirectStandardError = true;
-		startInfo.RedirectStandardInput = redirectInput;
+		var startInfo = ProcessRunner.CreateStartInfo(ShellCommand.Executable, arguments);
+		if (redirectInput)
+			startInfo.RedirectStandardInput = true;
 		return startInfo;
 	}
 
-	public static Process StartProcess(IEnumerable<string> arguments, bool redirectInput = false)
-	{
-		var startInfo = CreateRedirectedStartInfo(arguments, redirectInput);
-		var process = new Process { StartInfo = startInfo };
-		process.Start();
-		return process;
-	}
-
-	public static ProcessStreamEngine CreateEngineForRunningProcess(IEnumerable<string> arguments, bool redirectInput = false)
-	{
-		var process = StartProcess(arguments, redirectInput);
-		return new ProcessStreamEngine(process);
-	}
-
-	public static ProcessStreamEngine CreateDeferredEngine(IEnumerable<string> arguments, bool redirectInput = false)
-	{
-		var startInfo = CreateRedirectedStartInfo(arguments, redirectInput);
-		return ProcessStreamEngine.CreateDeferred(startInfo);
-	}
-
-	public static async Task<ProcessStreamEngine> RunToCompletionAsync(
+	public static ProcessSession StartSession(
 		IEnumerable<string> arguments,
-		Action<ProcessStreamEngine>? configure = null,
-		int timeoutMs = 10000)
+		Action<ProcessSessionBuilder>? configure = null,
+		bool redirectInput = false,
+		bool keepTranscript = true)
 	{
-		var engine = CreateDeferredEngine(arguments);
-		configure?.Invoke(engine);
-		await engine.StartMonitoringAsync();
-		await engine.WaitForExitAsync(timeoutMs: timeoutMs);
-		return engine;
+		var startInfo = CreateRedirectedStartInfo(arguments, redirectInput);
+		var builder = ProcessSessionBuilder.Create(startInfo);
+		if (keepTranscript)
+			builder.KeepTranscript();
+		configure?.Invoke(builder);
+		return builder.Start();
 	}
 
-	public static Action<string, bool> CreateFakeConsoleHandler(out List<(string Line, bool IsError)> CapturedLines)
-	{
-		var captured = new List<(string Line, bool IsError)>();
-		CapturedLines = captured;
-		var handler = A.Fake<Action<string, bool>>();
-		A.CallTo(() => handler(A<string>._, A<bool>._))
-			.Invokes((string line, bool isError) => captured.Add((line, isError)));
-		return handler;
-	}
 }

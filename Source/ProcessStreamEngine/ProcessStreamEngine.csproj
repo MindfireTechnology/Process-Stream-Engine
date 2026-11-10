@@ -1,38 +1,43 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFrameworks>net10.0;net9.0;net8.0;net7.0;net6.0</TargetFrameworks>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
+	<PropertyGroup>
+		<TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<IsAotCompatible>true</IsAotCompatible>
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 
-    <PackageId>ProcessStreamEngine</PackageId>
-    <Version>1.1.0</Version>
-    <Authors>nzaugg</Authors>
-    <Company>Mindfire Tech</Company>
-    <Copyright>Copyright (c) 2026 Mindfire Tech</Copyright>
-    <Description>A lightweight .NET library for monitoring external process output and driving interactive command-line workflows. ProcessStreamEngine watches stdout and stderr, fires handlers when patterns match, captures structured data from output, and supports sending input to running processes.</Description>
-    <PackageProjectUrl>https://github.com/MindfireTechnology/Process-Stream-Engine</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/MindfireTechnology/Process-Stream-Engine</RepositoryUrl>
-    <RepositoryType>git</RepositoryType>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageIcon>Mindfire-Logo.png</PackageIcon>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageTags>process;cli;stdout;stderr;automation;interactive;dotnet</PackageTags>
+		<PackageId>ProcessStreamEngine</PackageId>
+		<Version>2.0.0</Version>
+		<Authors>nzaugg</Authors>
+		<Company>Mindfire Tech</Company>
+		<Copyright>Copyright (c) 2026 Mindfire Tech</Copyright>
+		<Description>AOT-friendly process output monitoring and interactive CLI automation with fan-out subscribers, pattern matching, and IAsyncEnumerable support.</Description>
+		<PackageProjectUrl>https://github.com/MindfireTechnology/Process-Stream-Engine</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/MindfireTechnology/Process-Stream-Engine</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageIcon>Mindfire-Logo.png</PackageIcon>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageTags>process;cli;stdout;stderr;automation;interactive;dotnet;aot</PackageTags>
 
-    <PublishRepositoryUrl>true</PublishRepositoryUrl>
-    <EmbedUntrackedSources>true</EmbedUntrackedSources>
-    <IncludeSymbols>true</IncludeSymbols>
-    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-  </PropertyGroup>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+	</PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Instances" Version="3.0.2" />
-    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
-  </ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Build.Tasks.Git" Version="10.0.403">
+			<PrivateAssets>all</PrivateAssets>
+			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+		</PackageReference>
+		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.403" PrivateAssets="All" />
+	</ItemGroup>
 
-  <ItemGroup>
-    <None Include="..\..\Resources\Mindfire-Logo.png" Pack="true" PackagePath="\" />
-    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
-    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
-  </ItemGroup>
+	<ItemGroup>
+		<None Include="..\..\Resources\Mindfire-Logo.png" Pack="true" PackagePath="\" />
+		<None Include="..\..\README.md" Pack="true" PackagePath="\" />
+		<None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+	</ItemGroup>
 </Project>
-

@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="ProcessStreamEngine/ProcessStreamEngine.csproj" />
   <Project Path="ProcessStreamEngine.Tests/ProcessStreamEngine.Tests.csproj" />
+  <Project Path="ProcessStreamEngine.AotSmoke/ProcessStreamEngine.AotSmoke.csproj" />
 </Solution>

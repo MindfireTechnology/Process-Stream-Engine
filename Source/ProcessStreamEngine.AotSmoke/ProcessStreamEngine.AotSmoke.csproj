@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<PublishAot>true</PublishAot>
+		<IsAotCompatible>true</IsAotCompatible>
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+		<InvariantGlobalization>true</InvariantGlobalization>
+		<!-- ILCompiler audit flags a transitive SDK advisory; smoke project only. -->
+		<NuGetAudit>false</NuGetAudit>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\ProcessStreamEngine\ProcessStreamEngine.csproj" />
+	</ItemGroup>
+</Project>
